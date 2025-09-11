@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: motherduck-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: MOTHERDUCK_TOKEN
+        sync: false  # 需要在Render控制台手动设置
