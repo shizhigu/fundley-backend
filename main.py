@@ -42,15 +42,12 @@ async def execute_query(request: QueryRequest):
         if not motherduck_token:
             raise HTTPException(status_code=500, detail="MOTHERDUCK_TOKEN environment variable not set")
         
-        # 连接DuckDB
-        conn = duckdb.connect()
+        # 连接MotherDuck数据库
+        # 格式: md:database_name 或 md:database_name.schema_name
+        motherduck_db = os.getenv("MOTHERDUCK_DATABASE", "financial_db")
+        connection_string = f"md:{motherduck_db}?motherduck_token={motherduck_token}"
         
-        # 安装并加载MotherDuck扩展
-        conn.execute("INSTALL motherduck;")
-        conn.execute("LOAD motherduck;")
-        
-        # 设置MotherDuck token
-        conn.execute(f"SET motherduck_token='{motherduck_token}';")
+        conn = duckdb.connect(connection_string)
         
         # 执行SQL查询
         result = conn.execute(request.sql)
@@ -95,13 +92,11 @@ async def test_connection():
         if not motherduck_token:
             return {"success": False, "error": "MOTHERDUCK_TOKEN not set"}
         
-        conn = duckdb.connect()
+        # 连接MotherDuck数据库
+        motherduck_db = os.getenv("MOTHERDUCK_DATABASE", "financial_db")
+        connection_string = f"md:{motherduck_db}?motherduck_token={motherduck_token}"
         
-        # 安装并加载MotherDuck扩展
-        conn.execute("INSTALL motherduck;")
-        conn.execute("LOAD motherduck;")
-        
-        conn.execute(f"SET motherduck_token='{motherduck_token}';")
+        conn = duckdb.connect(connection_string)
         
         # 简单测试查询
         result = conn.execute("SELECT 42 as test_number, 'Hello MotherDuck' as test_message")
