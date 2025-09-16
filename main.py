@@ -134,28 +134,30 @@ async def test_connection():
 
 # 财务数据处理函数
 def build_dynamic_sql(symbols: List[str], sql_formulas: Dict[str, str], quarters: int) -> str:
-    """构建动态SQL查询，使用LaTeX metrics的SQL公式"""
-    # 基础SELECT子句
-    select_fields = [
-        "symbol",
-        "fiscalyear",
-        "period",
-        "filingdate",
-        "date"
-    ]
+    """构建动态SQL查询，使用窗口函数确保每个symbol都有正确的季度数"""
+    # 基础字段
+    base_fields = ["symbol", "fiscalyear", "period", "filingdate", "date"]
 
-    # 添加SQL公式
-    for metric_id, sql_formula in sql_formulas.items():
-        select_fields.append(sql_formula)
+    # SQL公式字段
+    formula_fields = list(sql_formulas.values())
 
-    # 构建完整SQL
+    # 构建WITH子句使用窗口函数
     sql = f"""
-    SELECT {', '.join(select_fields)}
-    FROM financial_statements
-    WHERE symbol IN ({', '.join([f"'{s}'" for s in symbols])})
-      AND period IN ('Q1', 'Q2', 'Q3', 'Q4')
+    WITH ranked_data AS (
+        SELECT {', '.join(base_fields)},
+               {', '.join(formula_fields)},
+               ROW_NUMBER() OVER (
+                   PARTITION BY symbol
+                   ORDER BY fiscalyear DESC, period DESC
+               ) as rn
+        FROM financial_statements
+        WHERE symbol IN ({', '.join([f"'{s}'" for s in symbols])})
+          AND period IN ('Q1', 'Q2', 'Q3', 'Q4')
+    )
+    SELECT {', '.join(base_fields + formula_fields)}
+    FROM ranked_data
+    WHERE rn <= {quarters}
     ORDER BY symbol, fiscalyear DESC, period DESC
-    LIMIT {quarters * len(symbols)}
     """
 
     return sql
@@ -205,7 +207,7 @@ def format_for_frontend(df: pd.DataFrame, sql_formulas: Dict[str, str]) -> List[
             'metrics': {}
         }
 
-        # 处理每个指标
+        # 处理每个指标，使用AS后面的字段名作为key
         for metric in metric_fields:
             if metric in df.columns:
                 qoq_col = f'{metric}_qoq'
