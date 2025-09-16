@@ -142,9 +142,10 @@ def build_dynamic_sql(symbols: List[str], sql_formulas: Dict[str, str], quarters
     formula_fields = list(sql_formulas.values())
 
     # 构建WITH子句使用窗口函数
+    # 在WITH子句中先选择所有字段，然后计算公式
     sql = f"""
     WITH ranked_data AS (
-        SELECT {', '.join(base_fields)},
+        SELECT *,
                {', '.join(formula_fields)},
                ROW_NUMBER() OVER (
                    PARTITION BY symbol
@@ -154,7 +155,7 @@ def build_dynamic_sql(symbols: List[str], sql_formulas: Dict[str, str], quarters
         WHERE symbol IN ({', '.join([f"'{s}'" for s in symbols])})
           AND period IN ('Q1', 'Q2', 'Q3', 'Q4')
     )
-    SELECT {', '.join(base_fields + formula_fields)}
+    SELECT {', '.join(base_fields)}, {', '.join(formula_fields)}
     FROM ranked_data
     WHERE rn <= {quarters}
     ORDER BY symbol, fiscalyear DESC, period DESC
