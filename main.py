@@ -1,13 +1,16 @@
 """
-极简FastAPI服务 - MotherDuck SQL查询
+极简FastAPI服务 - MotherDuck SQL查询 + 财务数据分析
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import duckdb
+import pandas as pd
 import os
 import traceback
-from typing import List, Dict, Any
+import httpx
+from typing import List, Dict, Any, Optional
+from datetime import datetime
 
 app = FastAPI(title="MotherDuck SQL API", version="1.0.0")
 
@@ -28,6 +31,20 @@ class QueryResponse(BaseModel):
     data: List[Dict[str, Any]] = []
     row_count: int = 0
     error: str = ""
+
+# 财务数据请求模型
+class FinancialDataRequest(BaseModel):
+    symbols: List[str]
+    sqlFormulas: Dict[str, str]  # metricId -> SQL formula mapping
+    quarters: int
+
+# 财务数据响应模型
+class FinancialDataResponse(BaseModel):
+    symbol: str
+    fiscalYear: int
+    period: str
+    date: Optional[str]
+    metrics: Dict[str, Dict[str, Any]]
 
 @app.get("/")
 async def health_check():
@@ -114,6 +131,154 @@ async def test_connection():
             "success": False,
             "error": str(e)
         }
+
+# 财务数据处理函数
+def build_dynamic_sql(symbols: List[str], sql_formulas: Dict[str, str], quarters: int) -> str:
+    """构建动态SQL查询，使用LaTeX metrics的SQL公式"""
+    # 基础SELECT子句
+    select_fields = [
+        "symbol",
+        "fiscalyear",
+        "period",
+        "filingdate",
+        "date"
+    ]
+
+    # 添加SQL公式
+    for metric_id, sql_formula in sql_formulas.items():
+        select_fields.append(sql_formula)
+
+    # 构建完整SQL
+    sql = f"""
+    SELECT {', '.join(select_fields)}
+    FROM financial_statements
+    WHERE symbol IN ({', '.join([f"'{s}'" for s in symbols])})
+      AND period IN ('Q1', 'Q2', 'Q3', 'Q4')
+    ORDER BY symbol, fiscalyear DESC, period DESC
+    LIMIT {quarters * len(symbols)}
+    """
+
+    return sql
+
+def calculate_trends(df: pd.DataFrame, sql_formulas: Dict[str, str]) -> pd.DataFrame:
+    """计算同比环比增长率"""
+    if df.empty:
+        return df
+
+    # 确保数据按时间排序
+    df = df.sort_values(['symbol', 'fiscalyear', 'period'])
+
+    # 从SQL公式中提取字段名（AS后面的部分）
+    metric_fields = []
+    for sql_formula in sql_formulas.values():
+        if ' AS ' in sql_formula:
+            field_name = sql_formula.split(' AS ')[-1].strip()
+            metric_fields.append(field_name)
+
+    for metric in metric_fields:
+        if metric in df.columns:
+            # 环比 (QoQ) - 与上一季度比较
+            df[f'{metric}_qoq'] = df.groupby('symbol')[metric].pct_change() * 100
+
+            # 同比 (YoY) - 与去年同期比较 (lag 4 quarters)
+            df[f'{metric}_yoy'] = df.groupby(['symbol', 'period'])[metric].pct_change() * 100
+
+    return df
+
+def format_for_frontend(df: pd.DataFrame, sql_formulas: Dict[str, str]) -> List[FinancialDataResponse]:
+    """格式化为前端友好的JSON结构"""
+    result = []
+
+    # 从SQL公式中提取字段名（AS后面的部分）
+    metric_fields = []
+    for sql_formula in sql_formulas.values():
+        if ' AS ' in sql_formula:
+            field_name = sql_formula.split(' AS ')[-1].strip()
+            metric_fields.append(field_name)
+
+    for _, row in df.iterrows():
+        record = {
+            'symbol': row['symbol'],
+            'fiscalYear': int(row['fiscalyear']) if pd.notna(row['fiscalyear']) else 0,
+            'period': row['period'] if pd.notna(row['period']) else '',
+            'date': row['date'].isoformat() if pd.notna(row['date']) else None,
+            'metrics': {}
+        }
+
+        # 处理每个指标
+        for metric in metric_fields:
+            if metric in df.columns:
+                qoq_col = f'{metric}_qoq'
+                yoy_col = f'{metric}_yoy'
+
+                # 获取QoQ和YoY值
+                qoq_value = row[qoq_col] if qoq_col in df.columns and pd.notna(row[qoq_col]) else None
+                yoy_value = row[yoy_col] if yoy_col in df.columns and pd.notna(row[yoy_col]) else None
+
+                record['metrics'][metric] = {
+                    'value': float(row[metric]) if pd.notna(row[metric]) else None,
+                    'qoq': {
+                        'value': float(qoq_value) if qoq_value is not None else None,
+                        'direction': 'up' if qoq_value and qoq_value > 0 else 'down'
+                    },
+                    'yoy': {
+                        'value': float(yoy_value) if yoy_value is not None else None,
+                        'direction': 'up' if yoy_value and yoy_value > 0 else 'down'
+                    }
+                }
+
+        result.append(record)
+
+    return result
+
+@app.post("/financial-data")
+async def get_financial_data(request: FinancialDataRequest):
+    """获取财务数据并计算同比环比"""
+    try:
+        print(f"📊 Processing request: {len(request.symbols)} symbols, {len(request.sqlFormulas)} SQL formulas, {request.quarters} quarters")
+
+        # 获取MotherDuck连接
+        motherduck_token = os.getenv("MOTHERDUCK_TOKEN")
+        if not motherduck_token:
+            raise HTTPException(status_code=500, detail="MOTHERDUCK_TOKEN environment variable not set")
+
+        motherduck_db = os.getenv("MOTHERDUCK_DATABASE", "financial_db")
+        connection_string = f"md:{motherduck_db}?motherduck_token={motherduck_token}"
+
+        # 1. 构建动态SQL（使用SQL公式）
+        sql = build_dynamic_sql(request.symbols, request.sqlFormulas, request.quarters)
+        print(f"🔍 Generated SQL:\n{sql}")
+
+        # 2. 执行SQL查询
+        conn = duckdb.connect(connection_string)
+        df = conn.execute(sql).df()
+        conn.close()
+
+        print(f"📈 Retrieved {len(df)} rows from database")
+
+        if df.empty:
+            print("⚠️  No data found for given criteria")
+            return []
+
+        # 3. 计算同比环比
+        df_with_trends = calculate_trends(df, request.sqlFormulas)
+        print(f"🧮 Calculated trends for {len(request.sqlFormulas)} metrics")
+
+        # 4. 格式化为前端格式
+        result = format_for_frontend(df_with_trends, request.sqlFormulas)
+        print(f"✅ Formatted {len(result)} records for frontend")
+
+        return result
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"❌ Financial data processing failed: {error_msg}")
+        print(f"🔍 Traceback: {traceback.format_exc()}")
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process financial data: {error_msg}"
+        )
 
 if __name__ == "__main__":
     import uvicorn
