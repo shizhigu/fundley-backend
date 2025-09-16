@@ -9,6 +9,7 @@ import pandas as pd
 import os
 import traceback
 import httpx
+import asyncio
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -161,13 +162,82 @@ def build_single_symbol_sql(symbol: str, sql_formulas: Dict[str, str], quarters:
 
     return sql
 
+async def query_single_symbol_async(symbol: str, sql_formulas: Dict[str, str], quarters: int, connection_string: str) -> pd.DataFrame:
+    """异步查询单个symbol的数据"""
+    try:
+        # 为每个symbol创建独立连接
+        conn = duckdb.connect(connection_string)
+        sql = build_single_symbol_sql(symbol, sql_formulas, quarters)
+        print(f"🔍 Querying {symbol}: {sql[:100]}...")
+
+        # 在线程池中执行SQL查询
+        def execute_query():
+            return conn.execute(sql).df()
+
+        # 使用asyncio的线程池执行阻塞操作
+        loop = asyncio.get_event_loop()
+        df = await loop.run_in_executor(None, execute_query)
+
+        conn.close()
+
+        if not df.empty:
+            print(f"✅ {symbol}: {len(df)} records")
+            return df
+        else:
+            print(f"⚠️  {symbol}: No data found")
+            return pd.DataFrame()
+
+    except Exception as e:
+        print(f"❌ Error querying {symbol}: {e}")
+        return pd.DataFrame()
+
+async def execute_multi_symbol_query_async(symbols: List[str], sql_formulas: Dict[str, str], quarters: int, connection_string: str) -> pd.DataFrame:
+    """异步执行多个symbol的查询并合并结果"""
+    print(f"🚀 Starting async queries for {len(symbols)} symbols")
+
+    # 创建所有查询任务
+    tasks = [
+        query_single_symbol_async(symbol, sql_formulas, quarters, connection_string)
+        for symbol in symbols
+    ]
+
+    # 并行执行所有查询
+    dataframes = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 过滤出成功的结果
+    all_dataframes = []
+    for i, df in enumerate(dataframes):
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            all_dataframes.append(df)
+        elif isinstance(df, Exception):
+            print(f"❌ Exception for {symbols[i]}: {df}")
+
+    # 合并所有数据
+    if all_dataframes:
+        combined_df = pd.concat(all_dataframes, ignore_index=True)
+
+        # 添加period排序辅助列
+        period_order = {'Q4': 1, 'Q3': 2, 'Q2': 3, 'Q1': 4}
+        combined_df['period_order'] = combined_df['period'].map(period_order)
+
+        # 排序：按symbol分组，每组内按时间倒序（最新在前）
+        combined_df = combined_df.sort_values(['symbol', 'fiscalyear', 'period_order'], ascending=[True, False, True])
+
+        # 删除辅助列
+        combined_df = combined_df.drop('period_order', axis=1)
+
+        print(f"📊 Combined result: {len(combined_df)} total records")
+        return combined_df
+    else:
+        print("❌ No data found for any symbols")
+        return pd.DataFrame()
+
 def execute_multi_symbol_query(symbols: List[str], sql_formulas: Dict[str, str], quarters: int, conn) -> pd.DataFrame:
-    """执行多个symbol的查询并合并结果"""
+    """同步版本的多symbol查询（保留作为备用）"""
     all_dataframes = []
 
     for symbol in symbols:
         try:
-            # 为每个symbol单独查询
             sql = build_single_symbol_sql(symbol, sql_formulas, quarters)
             print(f"🔍 Querying {symbol}: {sql[:100]}...")
 
@@ -191,7 +261,6 @@ def execute_multi_symbol_query(symbols: List[str], sql_formulas: Dict[str, str],
         combined_df['period_order'] = combined_df['period'].map(period_order)
 
         # 排序：按symbol分组，每组内按时间倒序（最新在前）
-        # symbol升序，fiscalyear降序，period_order升序（Q4=1 < Q3=2 < Q2=3 < Q1=4）
         combined_df = combined_df.sort_values(['symbol', 'fiscalyear', 'period_order'], ascending=[True, False, True])
 
         # 删除辅助列
@@ -288,10 +357,8 @@ async def get_financial_data(request: FinancialDataRequest):
         motherduck_db = os.getenv("MOTHERDUCK_DATABASE", "financial_db")
         connection_string = f"md:{motherduck_db}?motherduck_token={motherduck_token}"
 
-        # 1. 执行多symbol查询（使用拆分方案）
-        conn = duckdb.connect(connection_string)
-        df = execute_multi_symbol_query(request.symbols, request.sqlFormulas, request.quarters, conn)
-        conn.close()
+        # 1. 执行多symbol查询（使用异步拆分方案）
+        df = await execute_multi_symbol_query_async(request.symbols, request.sqlFormulas, request.quarters, connection_string)
 
         print(f"📈 Retrieved {len(df)} rows from database")
 
