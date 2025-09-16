@@ -133,35 +133,75 @@ async def test_connection():
         }
 
 # 财务数据处理函数
-def build_dynamic_sql(symbols: List[str], sql_formulas: Dict[str, str], quarters: int) -> str:
-    """构建动态SQL查询，使用窗口函数确保每个symbol都有正确的季度数"""
+def build_single_symbol_sql(symbol: str, sql_formulas: Dict[str, str], quarters: int) -> str:
+    """为单个symbol构建SQL查询"""
     # 基础字段
     base_fields = ["symbol", "fiscalyear", "period", "filingdate", "date"]
 
     # SQL公式字段
     formula_fields = list(sql_formulas.values())
 
-    # 构建WITH子句使用窗口函数
-    # 在WITH子句中先选择所有字段，然后计算公式
+    # 构建简单的SQL查询
+    # 使用CASE来确保period按Q4, Q3, Q2, Q1的顺序排序
     sql = f"""
-    WITH ranked_data AS (
-        SELECT *,
-               {', '.join(formula_fields)},
-               ROW_NUMBER() OVER (
-                   PARTITION BY symbol
-                   ORDER BY fiscalyear DESC, period DESC
-               ) as rn
-        FROM financial_statements
-        WHERE symbol IN ({', '.join([f"'{s}'" for s in symbols])})
-          AND period IN ('Q1', 'Q2', 'Q3', 'Q4')
-    )
     SELECT {', '.join(base_fields)}, {', '.join(formula_fields)}
-    FROM ranked_data
-    WHERE rn <= {quarters}
-    ORDER BY symbol, fiscalyear DESC, period DESC
+    FROM financial_statements
+    WHERE symbol = '{symbol}'
+      AND period IN ('Q1', 'Q2', 'Q3', 'Q4')
+    ORDER BY fiscalyear DESC,
+             CASE period
+                WHEN 'Q4' THEN 1
+                WHEN 'Q3' THEN 2
+                WHEN 'Q2' THEN 3
+                WHEN 'Q1' THEN 4
+                ELSE 5
+             END ASC
+    LIMIT {quarters}
     """
 
     return sql
+
+def execute_multi_symbol_query(symbols: List[str], sql_formulas: Dict[str, str], quarters: int, conn) -> pd.DataFrame:
+    """执行多个symbol的查询并合并结果"""
+    all_dataframes = []
+
+    for symbol in symbols:
+        try:
+            # 为每个symbol单独查询
+            sql = build_single_symbol_sql(symbol, sql_formulas, quarters)
+            print(f"🔍 Querying {symbol}: {sql[:100]}...")
+
+            df = conn.execute(sql).df()
+            if not df.empty:
+                print(f"✅ {symbol}: {len(df)} records")
+                all_dataframes.append(df)
+            else:
+                print(f"⚠️  {symbol}: No data found")
+
+        except Exception as e:
+            print(f"❌ Error querying {symbol}: {e}")
+            continue
+
+    # 合并所有数据
+    if all_dataframes:
+        combined_df = pd.concat(all_dataframes, ignore_index=True)
+
+        # 添加period排序辅助列
+        period_order = {'Q4': 1, 'Q3': 2, 'Q2': 3, 'Q1': 4}
+        combined_df['period_order'] = combined_df['period'].map(period_order)
+
+        # 排序：按symbol分组，每组内按时间倒序（最新在前）
+        # symbol升序，fiscalyear降序，period_order升序（Q4=1 < Q3=2 < Q2=3 < Q1=4）
+        combined_df = combined_df.sort_values(['symbol', 'fiscalyear', 'period_order'], ascending=[True, False, True])
+
+        # 删除辅助列
+        combined_df = combined_df.drop('period_order', axis=1)
+
+        print(f"📊 Combined result: {len(combined_df)} total records")
+        return combined_df
+    else:
+        print("❌ No data found for any symbols")
+        return pd.DataFrame()
 
 def calculate_trends(df: pd.DataFrame, sql_formulas: Dict[str, str]) -> pd.DataFrame:
     """计算同比环比增长率"""
@@ -248,13 +288,9 @@ async def get_financial_data(request: FinancialDataRequest):
         motherduck_db = os.getenv("MOTHERDUCK_DATABASE", "financial_db")
         connection_string = f"md:{motherduck_db}?motherduck_token={motherduck_token}"
 
-        # 1. 构建动态SQL（使用SQL公式）
-        sql = build_dynamic_sql(request.symbols, request.sqlFormulas, request.quarters)
-        print(f"🔍 Generated SQL:\n{sql}")
-
-        # 2. 执行SQL查询
+        # 1. 执行多symbol查询（使用拆分方案）
         conn = duckdb.connect(connection_string)
-        df = conn.execute(sql).df()
+        df = execute_multi_symbol_query(request.symbols, request.sqlFormulas, request.quarters, conn)
         conn.close()
 
         print(f"📈 Retrieved {len(df)} rows from database")
