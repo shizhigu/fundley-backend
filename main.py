@@ -143,7 +143,11 @@ def build_single_symbol_sql(symbol: str, sql_formulas: Dict[str, str], quarters:
     formula_fields = list(sql_formulas.values())
 
     # 构建简单的SQL查询
-    # 使用CASE来确保period按Q4, Q3, Q2, Q1的顺序排序
+    # 为了计算YoY和QoQ，需要额外的历史数据
+    # YoY需要前4个季度，QoQ需要前1个季度，所以多取4个季度的数据
+    extra_quarters = 4
+    total_limit = quarters + extra_quarters
+
     sql = f"""
     SELECT {', '.join(base_fields)}, {', '.join(formula_fields)}
     FROM financial_statements
@@ -157,7 +161,7 @@ def build_single_symbol_sql(symbol: str, sql_formulas: Dict[str, str], quarters:
                 WHEN 'Q1' THEN 4
                 ELSE 5
              END ASC
-    LIMIT {quarters}
+    LIMIT {total_limit}
     """
 
     return sql
@@ -370,8 +374,26 @@ async def get_financial_data(request: FinancialDataRequest):
         df_with_trends = calculate_trends(df, request.sqlFormulas)
         print(f"🧮 Calculated trends for {len(request.sqlFormulas)} metrics")
 
-        # 4. 格式化为前端格式
-        result = format_for_frontend(df_with_trends, request.sqlFormulas)
+        # 4. 只保留前端需要的季度数（去掉用于计算趋势的额外数据）
+        def filter_latest_quarters(group):
+            # 按时间倒序排序，然后取前request.quarters个
+            sorted_group = group.sort_values(['fiscalyear', 'period_order'], ascending=[False, True])
+            return sorted_group.head(request.quarters)
+
+        # 添加period排序辅助列进行筛选
+        period_order = {'Q4': 1, 'Q3': 2, 'Q2': 3, 'Q1': 4}
+        df_with_trends['period_order'] = df_with_trends['period'].map(period_order)
+
+        # 按symbol分组，每组只保留最新的quarters个季度
+        df_filtered = df_with_trends.groupby('symbol').apply(filter_latest_quarters).reset_index(drop=True)
+
+        # 删除辅助列
+        df_filtered = df_filtered.drop('period_order', axis=1)
+
+        print(f"🔽 Filtered to {len(df_filtered)} records for frontend (showing latest {request.quarters} quarters per symbol)")
+
+        # 5. 格式化为前端格式
+        result = format_for_frontend(df_filtered, request.sqlFormulas)
         print(f"✅ Formatted {len(result)} records for frontend")
 
         return result
